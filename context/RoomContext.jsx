@@ -15,7 +15,11 @@ export function RoomProvider({ code, children }) {
   const [room, setRoom] = useState(null);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
-  const offset = useRef(0); // server clock minus my clock
+  // Server clock minus my clock. Measured on every answer, but used SMOOTHLY: the answer
+  // with the fastest round trip is the most precise one, and the clock in now() glides to
+  // a new value instead of jumping (jumps made everything that depends on time stutter).
+  const clock = useRef({ target: 0, shown: 0, at: 0, synced: false, samples: [] });
+  const newest = useRef(0); // serverNow of the newest answer I used (older ones that arrive late are skipped)
   const busy = useRef(false);
   const joined = useRef(false); // was I in the room before? (to notice being removed)
   const lastInput = useRef(Date.now()); // last mouse / keyboard / touch use
@@ -49,12 +53,24 @@ export function RoomProvider({ code, children }) {
     [showNotice],
   );
 
+  const sync = useCallback((serverNow, sentAt, gotAt) => {
+    const c = clock.current;
+    const sample = { offset: serverNow - (sentAt + gotAt) / 2, rtt: gotAt - sentAt, at: gotAt };
+    c.samples = [...c.samples.filter((s) => gotAt - s.at < 20000), sample].slice(-30);
+    const best = c.samples.reduce((a, b) => (b.rtt < a.rtt ? b : a));
+    c.target = best.offset;
+    if (!c.synced || Math.abs(c.target - c.shown) > 1000) Object.assign(c, { shown: c.target, synced: true });
+  }, []);
+
   const handle = useCallback(
-    async (res, fatal) => {
+    async (res, fatal, sentAt) => {
+      const gotAt = Date.now();
       const data = await res.json();
       if (res.status >= 500) pauseUntil.current = Date.now() + 2000;
       if (res.ok) {
-        offset.current = data.serverNow - Date.now();
+        sync(data.serverNow, sentAt ?? gotAt, gotAt);
+        if (data.serverNow < newest.current) return; // an older answer that arrived late
+        newest.current = data.serverNow;
         const mine = data.room.players[getPlayerId()];
         announce(previous.current, data.room.players);
         previous.current = data.room.players;
@@ -66,14 +82,16 @@ export function RoomProvider({ code, children }) {
       } else if (fatal || res.status >= 404) setError(data.error);
       else showNotice(data.error);
     },
-    [announce, showNotice],
+    [announce, showNotice, sync],
   );
 
   const send = useCallback(
-    (action) =>
-      fetch(url, { method: "POST", body: JSON.stringify({ playerId: me, ...action }) })
-        .then((res) => handle(res, action.type === "join"))
-        .catch(() => {}),
+    (action) => {
+      const sentAt = Date.now();
+      return fetch(url, { method: "POST", body: JSON.stringify({ playerId: me, ...action }) })
+        .then((res) => handle(res, action.type === "join", sentAt))
+        .catch(() => {});
+    },
     [url, me, handle],
   );
   useEffect(() => {
@@ -115,11 +133,22 @@ export function RoomProvider({ code, children }) {
   // "Still here", but only if the player actually did something in the last 15 seconds
   useInterval(() => Date.now() - lastInput.current < PING_MS && send({ type: "ping" }), me && !error ? PING_MS : null);
   useInterval(
-    () => fetch(url).then((res) => handle(res)).catch(() => {}),
+    () => {
+      const sentAt = Date.now();
+      fetch(url).then((res) => handle(res, false, sentAt)).catch(() => {});
+    },
     me && !error ? (POLL[room?.game?.type] ?? 1000) : null,
   );
 
-  const now = useCallback(() => Date.now() + offset.current, []); // the SERVER's time
+  // The SERVER's time. Glides at most 5% faster/slower to catch up with a new measurement.
+  const now = useCallback(() => {
+    const t = Date.now();
+    const c = clock.current;
+    const step = Math.max(0, t - c.at) * 0.05;
+    c.at = t;
+    c.shown += Math.max(-step, Math.min(step, c.target - c.shown));
+    return t + c.shown;
+  }, []);
   const value = useMemo(
     () => ({ code, me, room, error, notice, send, sendLive, now }),
     [code, me, room, error, notice, send, sendLive, now],
